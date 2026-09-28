@@ -35,6 +35,9 @@ _executor_max_workers: int = 0
 _records_lock = threading.Lock()
 # delegation_id -> record dict; kept for the run plus a short completed tail.
 _records: Dict[str, Dict[str, Any]] = {}
+# A2A reply ownership (task id == triggering message id -> dispatch ids). Outlives the bounded
+# completed-records tail until the adapter settles that task; volatile like the A2A TaskStore.
+_a2a_reply_receipts: Dict[str, set] = {}
 
 _DEFAULT_MAX_ASYNC_CHILDREN = 3
 # Completed records retained (in memory and in the ledger) for status queries.
@@ -68,7 +71,8 @@ _LIVE_STATES = {"running", "stalling", "finalizing"}
 _ACTIVE_STATES = ("running", "stalling")
 # Routing origin persisted at dispatch so a restart-recovered completion can
 # reconstruct a full SessionSource (scope_id drives relay tenant egress).
-_ROUTING_KEYS = ("scope_id", "user_id", "user_name")
+# ``message_id`` = triggering message: the completion wake carries it as its reply anchor.
+_ROUTING_KEYS = ("scope_id", "user_id", "user_name", "message_id")
 # Structured stall metadata — additive, present only on stall finalizations.
 _STALL_META_KEYS = ("stalled_after_quiet_seconds", "stall_threshold_seconds", "stall_phase", "stall_grace_seconds")
 # Private stall bookkeeping on the record -> public field in list_async_delegations().
@@ -120,13 +124,24 @@ def _transaction():
     return transaction(_connect())
 
 
+def _session_platform() -> str:
+    try:
+        from gateway.session_context import get_session_env
+        return get_session_env("HERMES_SESSION_PLATFORM", "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _capture_routing_origin() -> Dict[str, Any]:
     """Snapshot scope_id/user_id/user_name on the PARENT thread (the daemon worker
     has no contextvars) so a restart-replayed completion can rebuild a SessionSource.
     Best-effort: empty values are omitted."""
     try:
         from gateway.session_context import get_session_env
-        return {k: v for k in _ROUTING_KEYS if (v := get_session_env(f"HERMES_SESSION_{k.upper()}", ""))}
+        origin = {k: v for k in _ROUTING_KEYS if (v := get_session_env(f"HERMES_SESSION_{k.upper()}", ""))}
+        if get_session_env("HERMES_SESSION_PLATFORM", "") != "a2a":
+            origin.pop("message_id", None)  # only A2A uses the trigger id as the reply owner
+        return origin
     except Exception:  # noqa: BLE001 - routing origin is additive, never fatal
         return {}
 
@@ -461,14 +476,15 @@ def active_task_count() -> int:
             for r in _records.values() if r.get("status") in {"running", "finalizing"})
 
 
-def _session_records(statuses, session_key: str, origin_ui_session_id: str, parent_session_id: str) -> list:
+def _session_records(statuses, session_key: str, origin_ui_session_id: str, parent_session_id: str,
+                     message_id: str = "") -> list:
     """Records in ``statuses`` owned by a session: any non-empty selector claims the
     record — ``origin_ui_session_id`` (TUI tab), ``session_key`` (routing key at
     dispatch), or ``parent_session_id`` (spawner's durable id — the right one for
     gateway chats, whose session_key survives ``/new`` while the session id rotates)."""
     selectors = [(field, wanted) for field, wanted in (
         ("origin_ui_session_id", origin_ui_session_id), ("session_key", session_key),
-        ("parent_session_id", parent_session_id)) if wanted]
+        ("parent_session_id", parent_session_id), ("message_id", message_id)) if wanted]
     if not selectors:
         return []
     with _records_lock:
@@ -476,9 +492,24 @@ def _session_records(statuses, session_key: str, origin_ui_session_id: str, pare
                 and any(str(r.get(field) or "") == wanted for field, wanted in selectors)]
 
 
-def has_live_for_session(session_key: str = "", origin_ui_session_id: str = "", parent_session_id: str = "") -> bool:
-    """Whether a session still owns any live (running/stalling/finalizing) delegation."""
-    return bool(_session_records(_LIVE_STATES, session_key, origin_ui_session_id, parent_session_id))
+def has_live_for_session(session_key: str = "", origin_ui_session_id: str = "", parent_session_id: str = "",
+                          message_id: str = "") -> bool:
+    """Whether a session (or the turn triggered by ``message_id``) still owns any live delegation."""
+    return bool(_session_records(_LIVE_STATES, session_key, origin_ui_session_id, parent_session_id, message_id))
+
+
+def delegation_ids_for_message(message_id: str) -> frozenset:
+    """A2A: dispatch ids armed by the turn(s) of ``message_id``, even after records were pruned."""
+    if not message_id:
+        return frozenset()
+    with _records_lock:
+        return frozenset(_a2a_reply_receipts.get(message_id, ()))
+
+
+def release_reply_receipts(message_id: str) -> None:
+    """A2A task terminal: drop its volatile receipts."""
+    with _records_lock:
+        _a2a_reply_receipts.pop(message_id, None)
 
 
 def _new_delegation_id() -> str:
@@ -560,6 +591,8 @@ def _dispatch(
         if record["slot_key"] not in active_slots and len(active_slots) >= max_async_children:
             return {"status": "rejected", "error": capacity_error}
         _records[delegation_id] = record
+        if record.get("message_id") and _session_platform() == "a2a":
+            _a2a_reply_receipts.setdefault(record["message_id"], set()).add(delegation_id)
         live_units = sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
     _persist_dispatch(record)
     # Units of one call share a slot, so live units can exceed slots: size the pool by units or a
@@ -981,6 +1014,7 @@ def _reset_for_tests() -> None:
         thread.join(timeout=2)
     with _records_lock:
         _records.clear()
+        _a2a_reply_receipts.clear()
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

@@ -1364,6 +1364,14 @@ class GatewayNotificationsMixin:
     def _event_route_key(evt: dict, fields: tuple[str, ...]) -> tuple[str, ...]:
         return tuple(str(evt.get(field) or "") for field in fields)
 
+    @classmethod
+    def _async_group_key(cls, evt: dict) -> tuple[str, ...]:
+        key = cls._event_route_key(evt, cls._ASYNC_GROUP_KEY_FIELDS)
+        if str(evt.get("platform") or "") == "a2a":
+            # A2A: message_id is the task id and the wake's only reply anchor; never merge two tasks.
+            key += (str(evt.get("message_id") or ""),)
+        return key
+
     @staticmethod
     def _format_coalesced_process_completions(entries: list[tuple[str, dict, asyncio.Future]]) -> str:
         """Build one bounded synthetic event from several redacted completions."""
@@ -1480,6 +1488,9 @@ class GatewayNotificationsMixin:
         if self._completion_notification_batches_stopping:
             return False
         key = self._event_route_key(evt, self._COMPLETION_BATCH_KEY_FIELDS)
+        if str(evt.get("platform") or "") == "a2a":
+            # A2A: message_id is the task id and the wake's only reply anchor; never merge two tasks.
+            key += (str(evt.get("message_id") or ""),)
         future = asyncio.get_running_loop().create_future()
         self._completion_notification_batches.setdefault(key, []).append((synth_text, evt, future))
         if key not in self._completion_notification_batch_tasks:
@@ -1628,7 +1639,7 @@ class GatewayNotificationsMixin:
                 groups: dict[tuple[str, ...], list[dict]] = {}
                 for evt in async_events:
                     self._enrich_async_delegation_routing(evt)
-                    groups.setdefault(self._event_route_key(evt, self._ASYNC_GROUP_KEY_FIELDS), []).append(evt)
+                    groups.setdefault(self._async_group_key(evt), []).append(evt)
                 for group in groups.values():
                     try:
                         delivered = await self._deliver_async_delegation_group(group)
